@@ -1,0 +1,22 @@
+{
+  "name": "drive-to-gcs",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "Cloud Run service to transfer files from Google Drive to Google Cloud Storage",
+  "dependencies": {
+    "@google-cloud/storage": "^6.6.0",
+    "express": "^5.1.0",
+    "googleapis": "^112.0.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
