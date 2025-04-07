@@ -1,9 +1,15 @@
 variable "project_id" {
-  description = "The ID of the GCP project"
-  default     = "video-analyzer-liam"
+  description = "The project ID to deploy to"
+  type        = string
 }
 
 variable "region" {
-  description = "GCP region"
-  default     = "us-central1"
+  description = "The region to deploy to"
+  type        = string
+}
+
+variable "gemini_api_key" {
+  description = "API key for Google's Gemini AI"
+  type        = string
+  sensitive   = true
 }

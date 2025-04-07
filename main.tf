@@ -65,3 +65,82 @@ resource "google_cloud_run_service_iam_member" "allow_unauthenticated" {
   role         = "roles/run.invoker"
   member       = "allUsers"
 }
+
+# Create a Service Account for the Video Processor
+resource "google_service_account" "video_processor_sa" {
+  account_id   = "video-processor-sa"
+  display_name = "Video Processor Service Account"
+}
+
+# Grant necessary permissions to the Video Processor Service Account
+resource "google_project_iam_member" "video_processor_storage_viewer" {
+  project = var.project_id
+  role    = "roles/storage.objectViewer"
+  member  = "serviceAccount:${google_service_account.video_processor_sa.email}"
+}
+
+# Deploy Video Processor as Cloud Run service
+resource "google_cloud_run_service" "video_processor" {
+  name     = "video-processor-service"
+  location = var.region
+
+  template {
+    spec {
+      containers {
+        image = "gcr.io/${var.project_id}/video-processor-image"
+        ports {
+          container_port = 8080
+        }
+        env {
+          name  = "GEMINI_API_KEY"
+          value = var.gemini_api_key
+        }
+      }
+      service_account_name = google_service_account.video_processor_sa.email
+    }
+  }
+}
+
+# Allow unauthenticated invocations for Video Processor
+resource "google_cloud_run_service_iam_member" "video_processor_allow_unauthenticated" {
+  service      = google_cloud_run_service.video_processor.name
+  location     = var.region
+  role         = "roles/run.invoker"
+  member       = "allUsers"
+}
+
+resource "google_pubsub_topic_iam_member" "storage_notification_publisher" {
+  topic = google_pubsub_topic.video_processing_topic.name
+  role  = "roles/pubsub.publisher"
+  member = "serviceAccount:service-540090171200@gs-project-accounts.iam.gserviceaccount.com"
+}
+
+# Create Cloud Storage notification for new video uploads
+resource "google_storage_notification" "video_notification" {
+  bucket         = google_storage_bucket.drive_to_gcs_bucket.name
+  payload_format = "JSON_API_V1"
+  topic          = google_pubsub_topic.video_processing_topic.name
+  event_types    = ["OBJECT_FINALIZE"]
+}
+
+# Create Pub/Sub topic for video processing
+resource "google_pubsub_topic" "video_processing_topic" {
+  name = "video-processing-topic"
+}
+
+# Create Pub/Sub subscription
+resource "google_pubsub_subscription" "video_processing_subscription" {
+  name  = "video-processing-subscription"
+  topic = google_pubsub_topic.video_processing_topic.name
+
+  push_config {
+    push_endpoint = google_cloud_run_service.video_processor.status[0].url
+  }
+}
+
+# Grant Pub/Sub publisher role
+resource "google_project_iam_member" "pubsub_publisher" {
+  project = var.project_id
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_service_account.video_processor_sa.email}"
+}
