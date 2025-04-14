@@ -2,6 +2,7 @@ const express = require("express");
 const { Storage } = require("@google-cloud/storage");
 const videoIntelligence = require("@google-cloud/video-intelligence");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const firestoreService = require("./services/firestoreService");
 
 const app = express();
 app.use(express.json());
@@ -16,20 +17,18 @@ const MAX_QUEUE_SIZE = 10; // Maximum number of items in the queue
 const processingQueue = [];
 let isProcessing = false;
 
+const MAX_LABELS_PER_SEGMENT = 5;
+const CONFIDENCE_THRESHOLD = 0.7;
+const FRAME_INTERVAL_SECONDS = 1;
+
 // Middleware to parse Pub/Sub messages
 app.use((req, res, next) => {
-  console.log(
-    `[${new Date().toISOString()}] 🔄 Received request: ${req.method} ${
-      req.path
-    }`
-  );
-
   if (req.body.message && req.body.message.data) {
     try {
       // Store the message ID for deduplication
       const messageId = req.body.message.messageId;
       console.log(
-        `[${new Date().toISOString()}] 📨 Pub/Sub message ID: ${messageId}`
+        `[${new Date().toISOString()}] 📨 Received Pub/Sub message ID: ${messageId}`
       );
 
       // Check if this message has already been processed
@@ -50,9 +49,9 @@ app.use((req, res, next) => {
       ).toString();
       req.body = JSON.parse(decodedData);
       console.log(
-        `[${new Date().toISOString()}] 📦 Decoded Pub/Sub message: bucket=${
-          req.body.bucket
-        }, file=${req.body.name}`
+        `[${new Date().toISOString()}] 📦 Processing file: ${
+          req.body.name
+        } (Message ID: ${messageId})`
       );
 
       // Store the message ID in the request for later use
@@ -77,40 +76,183 @@ const videoClient = new videoIntelligence.VideoIntelligenceServiceClient();
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Function to filter and optimize video analysis data
+function optimizeVideoData(trackedObjects, detectedLabels, detectedText) {
+  // Ensure inputs are arrays and have the expected structure
+  const objects = Array.isArray(trackedObjects) ? trackedObjects : [];
+  const labels = Array.isArray(detectedLabels) ? detectedLabels : [];
+  const text = Array.isArray(detectedText) ? detectedText : [];
+
+  console.log(
+    `[${new Date().toISOString()}] 🔍 Optimizing video data:`,
+    `Objects: ${objects.length}, Labels: ${labels.length}, Text: ${text.length}`
+  );
+
+  // Filter and optimize object tracking data
+  const optimizedObjects = objects.reduce((acc, obj) => {
+    if (!obj || typeof obj !== "object") return acc;
+
+    const key = (obj.description || "").toLowerCase();
+    if (!key) return acc;
+
+    if (!acc[key]) {
+      acc[key] = {
+        count: 0,
+        confidence: 0,
+        occurrences: [],
+      };
+    }
+    // Only include frames at specified intervals
+    if (obj.timestamp % FRAME_INTERVAL_SECONDS === 0) {
+      acc[key].count++;
+      acc[key].confidence += obj.confidence || 0;
+      acc[key].occurrences.push(obj.timestamp);
+    }
+    return acc;
+  }, {});
+
+  // Calculate average confidence and filter low confidence objects
+  Object.keys(optimizedObjects).forEach((key) => {
+    if (optimizedObjects[key].count > 0) {
+      optimizedObjects[key].confidence =
+        optimizedObjects[key].confidence / optimizedObjects[key].count;
+      if (optimizedObjects[key].confidence < CONFIDENCE_THRESHOLD) {
+        delete optimizedObjects[key];
+      }
+    }
+  });
+
+  // Filter and optimize label detection data
+  const optimizedLabels = labels
+    .filter(
+      (label) =>
+        label &&
+        typeof label === "object" &&
+        (label.confidence || 0) >= CONFIDENCE_THRESHOLD
+    )
+    .reduce((acc, label) => {
+      if (!label.timestamp) return acc;
+
+      const segmentKey = Math.floor(label.timestamp / FRAME_INTERVAL_SECONDS);
+      if (!acc[segmentKey]) {
+        acc[segmentKey] = [];
+      }
+      if (acc[segmentKey].length < MAX_LABELS_PER_SEGMENT) {
+        acc[segmentKey].push({
+          description: label.description || "",
+          confidence: label.confidence || 0,
+          timestamp: label.timestamp,
+        });
+      }
+      return acc;
+    }, {});
+
+  // Flatten and sort labels by confidence
+  const flattenedLabels = Object.values(optimizedLabels)
+    .flat()
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+
+  // Filter and optimize text detection data
+  const optimizedText = text
+    .filter(
+      (text) =>
+        text &&
+        typeof text === "object" &&
+        (text.confidence || 0) >= CONFIDENCE_THRESHOLD
+    )
+    .map((text) => ({
+      text: text.text || "",
+      confidence: text.confidence || 0,
+      timestamp: text.timestamp || 0,
+    }));
+
+  console.log(
+    `[${new Date().toISOString()}] ✅ Optimized data:`,
+    `Objects: ${Object.keys(optimizedObjects).length}, Labels: ${
+      flattenedLabels.length
+    }, Text: ${optimizedText.length}`
+  );
+
+  return {
+    objects: optimizedObjects,
+    labels: flattenedLabels,
+    text: optimizedText,
+  };
+}
+
 // Function to extract property details using Gemini
-async function extractPropertyDetailsWithGemini(transcription) {
+async function extractPropertyDetailsWithGemini(
+  transcription,
+  objectSummary,
+  labelSummary,
+  textSummary
+) {
   const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
+  // Optimize the data before sending to Gemini
+  const optimizedData = optimizeVideoData(
+    objectSummary,
+    labelSummary,
+    textSummary
+  );
+
   const prompt = `
-    You are a real estate property analyzer. Based on the following video transcription, 
-    extract the property details in a structured format. If any information is not explicitly mentioned, 
-    leave that field empty.
+    Analyze this property video and extract details in JSON format:
 
-    Video Transcription:
-    ${transcription}
+    Transcription: ${transcription}
+    Objects: ${JSON.stringify(optimizedData.objects, null, 2)}
+    Labels: ${JSON.stringify(optimizedData.labels, null, 2)}
+    Text: ${JSON.stringify(optimizedData.text, null, 2)}
 
-    Please extract and return ONLY a JSON object with the following structure:
+    Return a JSON object with:
     {
-      "type": "property type (e.g., Single Family Home, Condo, etc.)",
-      "style": "architectural style (e.g., Modern Farmhouse, Colonial, etc.)",
-      "bedrooms": "number of bedrooms",
-      "bathrooms": "number of bathrooms",
-      "squareFootage": "total square footage",
-      "yearBuilt": "year the property was built",
-      "lotSize": "lot size in acres",
-      "features": ["list of key features mentioned"],
-      "description": "brief property description",
+      "type": {
+        "value": "property type",
+        "confidence": "0-100"
+      },
+      "style": {
+        "value": "architectural style",
+        "confidence": "0-100"
+      },
+      "bedrooms": "number",
+      "bathrooms": "number",
+      "squareFootage": "total sq ft",
+      "yearBuilt": "year",
+      "lotSize": "acres",
+      "features": ["key features"],
+      "description": {
+        "value": "Comprehensive description including: style, features, rooms, condition, updates, outdoor spaces, smart features, and location benefits",
+        "confidence": "0-100"
+      },
       "roomDetails": [
         {
-          "room": "room name",
-          "features": ["list of features mentioned for this room"],
-          "description": "brief description of the room"
+          "room": "name",
+          "features": ["features"],
+          "description": "brief description",
+          "confidence": "0-100"
         }
-      ]
+      ],
+      "detectedObjects": {
+        "furniture": ["item (count: X, confidence: Y%)"],
+        "appliances": ["item (count: X, confidence: Y%)"],
+        "fixtures": ["item (count: X, confidence: Y%)"],
+        "other": ["item (count: X, confidence: Y%)"]
+      },
+      "detectedLabels": {
+        "rooms": ["room (confidence: Y%)"],
+        "styles": ["style (confidence: Y%)"],
+        "materials": ["material (confidence: Y%)"],
+        "features": ["feature (confidence: Y%)"],
+        "other": ["label (confidence: Y%)"]
+      },
+      "detectedText": {
+        "propertyDetails": ["text (confidence: Y%)"],
+        "prices": ["price info"],
+        "other": ["other text"]
+      }
     }
 
-    Only return the JSON object, nothing else.
-  `;
+    Only return the JSON object.`;
 
   try {
     console.log(
@@ -136,15 +278,42 @@ async function extractPropertyDetailsWithGemini(transcription) {
 }
 
 // Function to process a video
-async function processVideo(bucketName, fileName) {
-  console.log(`[${new Date().toISOString()}] 🎥 Processing video: ${fileName}`);
+async function processVideo(
+  bucketName,
+  fileName,
+  messageId,
+  driveFileId = null
+) {
+  console.log(
+    `[${new Date().toISOString()}] 🎥 Processing video: ${fileName} (Message ID: ${messageId})`
+  );
+
+  // Log Drive file ID if available
+  if (driveFileId) {
+    console.log(
+      `[${new Date().toISOString()}] 🔗 Google Drive file ID: ${driveFileId}`
+    );
+  }
 
   // Get the GCS URI for the video
   const gcsUri = `gs://${bucketName}/${fileName}`;
-  console.log(`[${new Date().toISOString()}] 🔗 GCS URI: ${gcsUri}`);
 
-  // Request video annotation - ONLY TRANSCRIPTION
-  const request = {
+  // Check if the file exists in GCS before processing
+  try {
+    const [exists] = await storage.bucket(bucketName).file(fileName).exists();
+    if (!exists) {
+      throw new Error(`File not found in bucket: ${fileName}`);
+    }
+  } catch (error) {
+    console.error(
+      `[${new Date().toISOString()}] ❌ Error checking file existence:`,
+      error.message
+    );
+    throw new Error(`Failed to access file ${fileName}: ${error.message}`);
+  }
+
+  // Request video annotation for transcription
+  const transcriptionRequest = {
     inputUri: gcsUri,
     features: ["SPEECH_TRANSCRIPTION"],
     videoContext: {
@@ -155,30 +324,58 @@ async function processVideo(bucketName, fileName) {
     },
   };
 
-  console.log(
-    `[${new Date().toISOString()}] 🚀 Starting video transcription request`
-  );
+  // Request video annotation for object tracking
+  const objectTrackingRequest = {
+    inputUri: gcsUri,
+    features: ["OBJECT_TRACKING"],
+  };
+
+  // Request video annotation for label detection
+  const labelDetectionRequest = {
+    inputUri: gcsUri,
+    features: ["LABEL_DETECTION"],
+  };
+
+  // Request video annotation for text detection
+  const textDetectionRequest = {
+    inputUri: gcsUri,
+    features: ["TEXT_DETECTION"],
+  };
 
   try {
-    // Start the video annotation operation
-    console.log(
-      `[${new Date().toISOString()}] 🔄 Calling Video Intelligence API`
+    // Start all video annotation operations
+    console.log(`[${new Date().toISOString()}] 🔄 Starting video analysis...`);
+    const [transcriptionOperation] = await videoClient.annotateVideo(
+      transcriptionRequest
     );
-    const [operation] = await videoClient.annotateVideo(request);
-
-    console.log(
-      `[${new Date().toISOString()}] ⏳ Waiting for transcription to complete...`
+    const [objectTrackingOperation] = await videoClient.annotateVideo(
+      objectTrackingRequest
     );
-
-    // Wait for the operation to complete
-    const [response] = await operation.promise();
-
-    console.log(
-      `[${new Date().toISOString()}] ✅ Video transcription completed`
+    const [labelDetectionOperation] = await videoClient.annotateVideo(
+      labelDetectionRequest
+    );
+    const [textDetectionOperation] = await videoClient.annotateVideo(
+      textDetectionRequest
     );
 
-    const annotationResults = response.annotationResults[0];
-    if (!annotationResults) {
+    console.log(
+      `[${new Date().toISOString()}] ⏳ Waiting for all operations to complete...`
+    );
+
+    // Wait for all operations to complete
+    const [transcriptionResponse] = await transcriptionOperation.promise();
+    const [objectTrackingResponse] = await objectTrackingOperation.promise();
+    const [labelDetectionResponse] = await labelDetectionOperation.promise();
+    const [textDetectionResponse] = await textDetectionOperation.promise();
+
+    console.log(`[${new Date().toISOString()}] ✅ Video analysis completed`);
+
+    const transcriptionResults = transcriptionResponse.annotationResults[0];
+    const objectTrackingResults = objectTrackingResponse.annotationResults[0];
+    const labelDetectionResults = labelDetectionResponse.annotationResults[0];
+    const textDetectionResults = textDetectionResponse.annotationResults[0];
+
+    if (!transcriptionResults) {
       throw new Error(
         "No transcription results returned from Video Intelligence API"
       );
@@ -186,19 +383,280 @@ async function processVideo(bucketName, fileName) {
 
     // Get the full transcription
     const transcription =
-      annotationResults.speechTranscriptions
-        ?.map((transcription) => transcription.alternatives[0].transcript)
-        .join("\n") || "";
+      transcriptionResults.speechTranscriptions
+        ?.map(
+          (transcription) => transcription.alternatives[0]?.transcript || ""
+        )
+        .join(" ") || "";
 
-    console.log(
-      `[${new Date().toISOString()}] 📝 Transcription extracted (${
-        transcription.length
-      } characters)`
+    // Extract object tracking information
+    const trackedObjects = (objectTrackingResults?.objectAnnotations || []).map(
+      (track) => ({
+        description: track.entity.description,
+        confidence: track.frames[0].normalizedBoundingBox.confidence,
+        timestamp: track.frames[0].timeOffset.seconds,
+      })
     );
 
+    // Extract label detection information
+    const detectedLabels = (
+      labelDetectionResults?.segmentLabelAnnotations || []
+    ).map((segment) => ({
+      description: segment.entity.description,
+      confidence: segment.segments[0].confidence,
+      timestamp: segment.segments[0].segment.startTimeOffset.seconds,
+    }));
+
+    // Extract text detection information
+    const detectedText = (textDetectionResults?.textAnnotations || []).map(
+      (text) => ({
+        text: text.text,
+        confidence: text.confidence,
+        timestamp: text.segments[0].segment.startTimeOffset.seconds,
+      })
+    );
+
+    // Filter and group objects by type
+    const objectSummary = trackedObjects.reduce((acc, obj) => {
+      const key = obj.description.toLowerCase();
+      if (!acc[key]) {
+        acc[key] = {
+          count: 0,
+          confidence: 0,
+          occurrences: [],
+        };
+      }
+      acc[key].count++;
+      acc[key].confidence += obj.confidence;
+      acc[key].occurrences.push(obj.timestamp);
+      return acc;
+    }, {});
+
+    // Calculate average confidence for each object type
+    Object.keys(objectSummary).forEach((key) => {
+      objectSummary[key].confidence =
+        objectSummary[key].confidence / objectSummary[key].count;
+    });
+
+    // Categorize objects into furniture, appliances, fixtures, and other
+    const categorizedObjects = {
+      furniture: [],
+      appliances: [],
+      fixtures: [],
+      other: [],
+    };
+
+    const furnitureKeywords = [
+      "chair",
+      "table",
+      "sofa",
+      "couch",
+      "bed",
+      "desk",
+      "cabinet",
+      "dresser",
+      "wardrobe",
+      "bookshelf",
+    ];
+    const applianceKeywords = [
+      "refrigerator",
+      "stove",
+      "oven",
+      "dishwasher",
+      "washer",
+      "dryer",
+      "microwave",
+      "air conditioner",
+    ];
+    const fixtureKeywords = [
+      "sink",
+      "toilet",
+      "bathtub",
+      "shower",
+      "faucet",
+      "light",
+      "fan",
+      "vent",
+    ];
+
+    Object.entries(objectSummary).forEach(([object, data]) => {
+      const objectLower = object.toLowerCase();
+      if (furnitureKeywords.some((keyword) => objectLower.includes(keyword))) {
+        categorizedObjects.furniture.push({ name: object, ...data });
+      } else if (
+        applianceKeywords.some((keyword) => objectLower.includes(keyword))
+      ) {
+        categorizedObjects.appliances.push({ name: object, ...data });
+      } else if (
+        fixtureKeywords.some((keyword) => objectLower.includes(keyword))
+      ) {
+        categorizedObjects.fixtures.push({ name: object, ...data });
+      } else {
+        categorizedObjects.other.push({ name: object, ...data });
+      }
+    });
+
+    // Categorize labels into relevant property aspects
+    const categorizedLabels = {
+      rooms: [],
+      styles: [],
+      materials: [],
+      features: [],
+      other: [],
+    };
+
+    const roomKeywords = [
+      "kitchen",
+      "bedroom",
+      "bathroom",
+      "living room",
+      "dining room",
+      "garage",
+      "basement",
+    ];
+    const styleKeywords = [
+      "modern",
+      "traditional",
+      "contemporary",
+      "classic",
+      "minimalist",
+      "rustic",
+    ];
+    const materialKeywords = [
+      "wood",
+      "marble",
+      "granite",
+      "stainless steel",
+      "ceramic",
+      "glass",
+      "concrete",
+    ];
+
+    detectedLabels.forEach((label) => {
+      const labelLower = label.description.toLowerCase();
+      if (roomKeywords.some((keyword) => labelLower.includes(keyword))) {
+        categorizedLabels.rooms.push({
+          name: label.description,
+          confidence: label.confidence,
+        });
+      } else if (
+        styleKeywords.some((keyword) => labelLower.includes(keyword))
+      ) {
+        categorizedLabels.styles.push({
+          name: label.description,
+          confidence: label.confidence,
+        });
+      } else if (
+        materialKeywords.some((keyword) => labelLower.includes(keyword))
+      ) {
+        categorizedLabels.materials.push({
+          name: label.description,
+          confidence: label.confidence,
+        });
+      } else if (
+        labelLower.includes("feature") ||
+        labelLower.includes("design")
+      ) {
+        categorizedLabels.features.push({
+          name: label.description,
+          confidence: label.confidence,
+        });
+      } else {
+        categorizedLabels.other.push({
+          name: label.description,
+          confidence: label.confidence,
+        });
+      }
+    });
+
+    // Display summaries of extracted information
+    console.log(`\n[${new Date().toISOString()}] 📊 Analysis Summary:`);
+    console.log(`Transcription: ${transcription.length} characters`);
+    console.log(
+      `Detected Objects: ${Object.keys(objectSummary).length} unique items`
+    );
+    console.log(`Detected Labels: ${detectedLabels.length} scenes/features`);
+    console.log(`Detected Text: ${detectedText.length} text segments`);
+
+    // Create a simplified summary for verification
+    const simplifiedSummary = {
+      type: objectSummary.type || "Not specified",
+      style: objectSummary.style || "Not specified",
+      bedrooms: objectSummary.bedrooms || "Not specified",
+      squareFootage: objectSummary.squareFootage || "Not specified",
+      roomCount: objectSummary.roomDetails
+        ? objectSummary.roomDetails.length
+        : 0,
+    };
+
+    console.log(
+      `[${new Date().toISOString()}] 📊 Simplified property summary:`,
+      simplifiedSummary
+    );
+
+    // Store raw analysis results in Firestore
+    console.log(
+      `[${new Date().toISOString()}] 📝 Storing raw analysis in Firestore...`
+    );
+    const firestoreId = await firestoreService.storeVideoAnalysis(fileName, {
+      transcription,
+      objects: trackedObjects,
+      labels: detectedLabels,
+      text: detectedText,
+      driveFileId, // Store Drive file ID in Firestore as well
+    });
+
+    // Check if we got a fallback ID
+    const isFallbackId =
+      firestoreId.startsWith("fallback_") || firestoreId.startsWith("error_");
+    if (isFallbackId) {
+      console.log(
+        `[${new Date().toISOString()}] ⚠️ Using fallback storage ID: ${firestoreId}`
+      );
+    } else {
+      console.log(
+        `[${new Date().toISOString()}] ✅ Raw analysis stored in Firestore with ID: ${firestoreId}`
+      );
+    }
+
     // Extract property details using Gemini
+    console.log(`[${new Date().toISOString()}] 🤖 Processing with Gemini...`);
     const propertyDetails = await extractPropertyDetailsWithGemini(
-      transcription
+      transcription,
+      categorizedObjects,
+      categorizedLabels,
+      detectedText
+    );
+    console.log(`[${new Date().toISOString()}] ✅ Gemini analysis completed`);
+
+    // Store processed analysis in Firestore
+    console.log(
+      `[${new Date().toISOString()}] 📝 Storing processed analysis in Firestore...`
+    );
+    const processedAnalysisId = await firestoreService.storeProcessedAnalysis(
+      fileName,
+      firestoreId,
+      propertyDetails,
+      driveFileId,
+      {
+        simplifiedSummary,
+        categorizedObjects,
+        categorizedLabels,
+        detectedText,
+        isFallbackStorage: isFallbackId,
+      }
+    );
+    console.log(
+      `[${new Date().toISOString()}] ✅ Processed analysis stored in Firestore with ID: ${processedAnalysisId}`
+    );
+
+    // Log a brief summary of the property details
+    console.log(
+      `[${new Date().toISOString()}] 📊 Property details: ${
+        propertyDetails.type || "Unknown type"
+      }, ${propertyDetails.style || "Unknown style"}, ${
+        propertyDetails.bedrooms || "Unknown bedrooms"
+      } beds`
     );
 
     // Mark file as processed
@@ -211,6 +669,9 @@ async function processVideo(bucketName, fileName) {
       success: true,
       transcription,
       propertyDetails,
+      simplifiedSummary,
+      firestoreId,
+      processedAnalysisId,
     };
   } catch (error) {
     console.error(
@@ -236,23 +697,24 @@ async function processQueue() {
   );
 
   try {
-    const { bucketName, fileName, res, messageId } = processingQueue.shift();
-    console.log(
-      `[${new Date().toISOString()}] 🔄 Processing queue item: ${fileName} (Message ID: ${
-        messageId || "N/A"
-      })`
-    );
+    const { bucketName, fileName, res, messageId, driveFileId } =
+      processingQueue.shift();
 
     try {
-      const result = await processVideo(bucketName, fileName);
-
-      // Mark the message as processed
+      // Mark the message as processed BEFORE processing to prevent duplicates
       if (messageId) {
         processedMessageIds.add(messageId);
         console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed`
+          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed BEFORE processing`
         );
       }
+
+      const result = await processVideo(
+        bucketName,
+        fileName,
+        messageId,
+        driveFileId
+      );
 
       // Return success response
       res.status(200).json({
@@ -291,11 +753,10 @@ async function processQueue() {
 
 app.post("/", async (req, res) => {
   try {
-    console.log(`[${new Date().toISOString()}] 📥 Received POST request`);
-
     const bucketName = req.body.bucket;
     const fileName = req.body.name;
     const messageId = req.messageId; // Get the message ID from the request
+    const driveFileId = req.body.driveFileId || null; // Extract Drive file ID from request
 
     if (!fileName) {
       console.error(
@@ -307,149 +768,36 @@ app.post("/", async (req, res) => {
       });
     }
 
-    console.log(
-      `[${new Date().toISOString()}] 📄 Processing request for file: ${fileName} (Message ID: ${
-        messageId || "N/A"
-      })`
-    );
-
     // Check if file has already been processed successfully
     if (processedFiles.has(fileName)) {
       console.log(
         `[${new Date().toISOString()}] ⚠️ File ${fileName} has already been processed successfully, skipping`
       );
-      // Mark the message as processed even if we skip the file
-      if (messageId) {
-        processedMessageIds.add(messageId);
-        console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed (file already processed)`
-        );
-      }
       return res.status(200).json({
-        message: "File already processed successfully",
+        message: "File already processed",
         fileName: fileName,
       });
     }
 
-    // Check if file has already failed processing
-    if (failedFiles.has(fileName)) {
-      console.log(
-        `[${new Date().toISOString()}] ⚠️ File ${fileName} has already failed processing, skipping`
-      );
-      // Mark the message as processed even if we skip the file
-      if (messageId) {
-        processedMessageIds.add(messageId);
-        console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed (file already failed)`
-        );
-      }
-      return res.status(200).json({
-        message: "File has already failed processing",
-        fileName: fileName,
-      });
-    }
+    // Add the video to the processing queue
+    processingQueue.push({ bucketName, fileName, res, messageId, driveFileId });
 
-    // Check if the file is a video
-    const videoExtensions = [".mp4", ".mov", ".avi", ".mkv", ".webm"];
-    const isVideo = videoExtensions.some((ext) =>
-      fileName.toLowerCase().endsWith(ext)
-    );
-
-    if (!isVideo) {
-      console.log(
-        `[${new Date().toISOString()}] ⚠️ File ${fileName} is not a video, skipping processing`
-      );
-      // Mark the message as processed even if we skip the file
-      if (messageId) {
-        processedMessageIds.add(messageId);
-        console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed (not a video)`
-        );
-      }
-      return res.status(200).json({
-        message: "File is not a video, skipping processing",
-        fileName: fileName,
-      });
-    }
-
-    // Check if the queue is too large
-    if (processingQueue.length >= MAX_QUEUE_SIZE) {
-      console.log(
-        `[${new Date().toISOString()}] ⚠️ Queue is full (${
-          processingQueue.length
-        } items), rejecting new request`
-      );
-      // Mark the message as processed even if we reject it
-      if (messageId) {
-        processedMessageIds.add(messageId);
-        console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed (queue full)`
-        );
-      }
-      return res.status(429).json({
-        error: "Processing queue is full",
-        details:
-          "The system is currently processing too many videos. Please try again later.",
-      });
-    }
-
-    // Check if this file is already in the queue
-    const isInQueue = processingQueue.some(
-      (item) => item.fileName === fileName
-    );
-    if (isInQueue) {
-      console.log(
-        `[${new Date().toISOString()}] ⚠️ File ${fileName} is already in the processing queue, skipping`
-      );
-      // Mark the message as processed even if we skip the file
-      if (messageId) {
-        processedMessageIds.add(messageId);
-        console.log(
-          `[${new Date().toISOString()}] ✅ Marked message ID ${messageId} as processed (already in queue)`
-        );
-      }
-      return res.status(200).json({
-        message: "File is already in the processing queue",
-        fileName: fileName,
-      });
-    }
-
-    // Add to processing queue
-    processingQueue.push({ bucketName, fileName, res, messageId });
-    console.log(
-      `[${new Date().toISOString()}] ➕ Added ${fileName} to processing queue. Queue length: ${
-        processingQueue.length
-      }`
-    );
-
-    // Start processing the queue if not already processing
+    // Process the queue
     processQueue();
   } catch (error) {
     console.error(
-      `[${new Date().toISOString()}] ❌ Error handling request:`,
+      `[${new Date().toISOString()}] ❌ Error processing request:`,
       error.message
     );
     res.status(500).json({
-      error: "Failed to handle request",
+      error: "Failed to process request",
       details: error.message,
     });
   }
 });
 
-// Add a health check endpoint
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    queueLength: processingQueue.length,
-    processedFiles: Array.from(processedFiles),
-    failedFiles: Array.from(failedFiles),
-    processedMessageIds: Array.from(processedMessageIds),
-  });
-});
+const PORT = process.env.PORT || 3000;
 
-const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(
-    `[${new Date().toISOString()}] 🚀 Video processor service listening on port ${PORT}`
-  );
+  console.log(`Server is running on port ${PORT}`);
 });

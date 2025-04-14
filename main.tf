@@ -79,6 +79,30 @@ resource "google_project_iam_member" "video_processor_storage_viewer" {
   member  = "serviceAccount:${google_service_account.video_processor_sa.email}"
 }
 
+# Create Firestore Database
+resource "google_firestore_database" "default" {
+  name        = "(default)"
+  location_id = var.region
+  type        = "FIRESTORE_NATIVE"
+  
+  # Ensure the database is created before other resources that depend on it
+  depends_on = [google_project_iam_member.video_processor_firestore_user]
+}
+
+# Grant necessary permissions to the Video Processor Service Account
+resource "google_project_iam_member" "video_processor_firestore_user" {
+  project = var.project_id
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.video_processor_sa.email}"
+}
+
+# Add Firestore Admin role to ensure the service account can create collections
+resource "google_project_iam_member" "video_processor_firestore_admin" {
+  project = var.project_id
+  role    = "roles/datastore.owner"
+  member  = "serviceAccount:${google_service_account.video_processor_sa.email}"
+}
+
 # Deploy Video Processor as Cloud Run service
 resource "google_cloud_run_service" "video_processor" {
   name     = "video-processor-service"
@@ -94,6 +118,16 @@ resource "google_cloud_run_service" "video_processor" {
         env {
           name  = "GEMINI_API_KEY"
           value = var.gemini_api_key
+        }
+        env {
+          name  = "REGION"
+          value = var.region
+        }
+        resources {
+          limits = {
+            memory = "1Gi"
+            cpu    = "1"
+          }
         }
       }
       service_account_name = google_service_account.video_processor_sa.email
