@@ -5,13 +5,6 @@ const VideoAnalysisTypes = {
     confidence: Number,
     timestamp: Number,
   },
-  Object: {
-    description: String,
-    confidence: Number,
-    timestamp: Number,
-    count: Number,
-    occurrences: Array,
-  },
   Label: {
     description: String,
     confidence: Number,
@@ -26,12 +19,6 @@ const VideoAnalysisTypes = {
 
 // Types for categorized data
 const CategorizedDataTypes = {
-  Objects: {
-    furniture: Array,
-    appliances: Array,
-    fixtures: Array,
-    other: Array,
-  },
   Labels: {
     rooms: Array,
     styles: Array,
@@ -52,10 +39,6 @@ const ApiRequestTypes = {
     inputUri: String,
     features: Array,
     videoContext: Object,
-  },
-  ObjectTracking: {
-    inputUri: String,
-    features: Array,
   },
   LabelDetection: {
     inputUri: String,

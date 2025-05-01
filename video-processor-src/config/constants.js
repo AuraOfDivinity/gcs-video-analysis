@@ -6,38 +6,6 @@ const API_CONFIG = {
 
 // Feature Keywords
 const KEYWORDS = {
-  FURNITURE: [
-    "chair",
-    "table",
-    "sofa",
-    "couch",
-    "bed",
-    "desk",
-    "cabinet",
-    "dresser",
-    "wardrobe",
-    "bookshelf",
-  ],
-  APPLIANCES: [
-    "refrigerator",
-    "stove",
-    "oven",
-    "dishwasher",
-    "washer",
-    "dryer",
-    "microwave",
-    "air conditioner",
-  ],
-  FIXTURES: [
-    "sink",
-    "toilet",
-    "bathtub",
-    "shower",
-    "faucet",
-    "light",
-    "fan",
-    "vent",
-  ],
   ROOMS: [
     "kitchen",
     "bedroom",
@@ -69,7 +37,6 @@ const KEYWORDS = {
 // API Features
 const API_FEATURES = {
   TRANSCRIPTION: ["SPEECH_TRANSCRIPTION"],
-  OBJECT_TRACKING: ["OBJECT_TRACKING"],
   LABEL_DETECTION: ["LABEL_DETECTION"],
   TEXT_DETECTION: ["TEXT_DETECTION"],
 };

@@ -1,8 +1,20 @@
 const express = require("express");
 const { Storage } = require("@google-cloud/storage");
 const videoIntelligence = require("@google-cloud/video-intelligence");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const OpenAI = require("openai");
 const firestoreService = require("./services/firestoreService");
+const { google } = require("googleapis");
+
+// Initialize Google Drive client
+const auth = new google.auth.GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/drive.file"],
+});
+const drive = google.drive({ version: "v3", auth });
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const app = express();
 app.use(express.json());
@@ -20,6 +32,8 @@ let isProcessing = false;
 const MAX_LABELS_PER_SEGMENT = 5;
 const CONFIDENCE_THRESHOLD = 0.7;
 const FRAME_INTERVAL_SECONDS = 1;
+
+const PROPERTY_ANALYSIS_FOLDER_ID = "1jPqOFqS_RisO97QAaOoMHgQtiYQOBgwa";
 
 // Middleware to parse Pub/Sub messages
 app.use((req, res, next) => {
@@ -73,9 +87,6 @@ app.use((req, res, next) => {
 const storage = new Storage();
 const videoClient = new videoIntelligence.VideoIntelligenceServiceClient();
 
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
 // Function to filter and optimize video analysis data
 function optimizeVideoData(trackedObjects, detectedLabels, detectedText) {
   // Ensure inputs are arrays and have the expected structure
@@ -84,12 +95,12 @@ function optimizeVideoData(trackedObjects, detectedLabels, detectedText) {
   const text = Array.isArray(detectedText) ? detectedText : [];
 
   console.log(
-    `[${new Date().toISOString()}] 🔍 Optimizing video data:`,
+    `[${new Date().toISOString()}] 🔍 Processing video data:`,
     `Objects: ${objects.length}, Labels: ${labels.length}, Text: ${text.length}`
   );
 
-  // Filter and optimize object tracking data
-  const optimizedObjects = objects.reduce((acc, obj) => {
+  // Process object tracking data with minimal filtering
+  const processedObjects = objects.reduce((acc, obj) => {
     if (!obj || typeof obj !== "object") return acc;
 
     const key = (obj.description || "").toLowerCase();
@@ -100,177 +111,801 @@ function optimizeVideoData(trackedObjects, detectedLabels, detectedText) {
         count: 0,
         confidence: 0,
         occurrences: [],
+        timestamps: [],
+        firstSeen: obj.timestamp,
+        lastSeen: obj.timestamp,
+        averageConfidence: 0,
+        maxConfidence: obj.confidence || 0,
+        minConfidence: obj.confidence || 0,
+        duration: 0,
+        frequency: 0,
+        context: [],
       };
     }
-    // Only include frames at specified intervals
-    if (obj.timestamp % FRAME_INTERVAL_SECONDS === 0) {
-      acc[key].count++;
-      acc[key].confidence += obj.confidence || 0;
-      acc[key].occurrences.push(obj.timestamp);
-    }
+
+    // Store all occurrences
+    acc[key].occurrences.push({
+      timestamp: obj.timestamp,
+      confidence: obj.confidence || 0,
+    });
+
+    acc[key].count++;
+    acc[key].confidence += obj.confidence || 0;
+    acc[key].timestamps.push(obj.timestamp);
+    acc[key].lastSeen = obj.timestamp;
+    acc[key].maxConfidence = Math.max(
+      acc[key].maxConfidence,
+      obj.confidence || 0
+    );
+    acc[key].minConfidence = Math.min(
+      acc[key].minConfidence,
+      obj.confidence || 0
+    );
+
     return acc;
   }, {});
 
-  // Calculate average confidence and filter low confidence objects
-  Object.keys(optimizedObjects).forEach((key) => {
-    if (optimizedObjects[key].count > 0) {
-      optimizedObjects[key].confidence =
-        optimizedObjects[key].confidence / optimizedObjects[key].count;
-      if (optimizedObjects[key].confidence < CONFIDENCE_THRESHOLD) {
-        delete optimizedObjects[key];
+  // Calculate statistics for each object
+  Object.keys(processedObjects).forEach((key) => {
+    if (processedObjects[key].count > 0) {
+      processedObjects[key].averageConfidence =
+        processedObjects[key].confidence / processedObjects[key].count;
+
+      // Sort timestamps for better analysis
+      processedObjects[key].timestamps.sort((a, b) => a - b);
+
+      // Calculate time span
+      processedObjects[key].timeSpan =
+        processedObjects[key].lastSeen - processedObjects[key].firstSeen;
+
+      // Calculate frequency (occurrences per second)
+      processedObjects[key].frequency =
+        processedObjects[key].count / (processedObjects[key].timeSpan || 1);
+
+      // Add context based on frequency and duration
+      if (processedObjects[key].frequency > 0.5) {
+        processedObjects[key].context.push("Frequently visible");
+      }
+      if (processedObjects[key].timeSpan > 10) {
+        processedObjects[key].context.push("Long duration presence");
+      }
+      if (processedObjects[key].averageConfidence > 0.7) {
+        processedObjects[key].context.push("High confidence detection");
       }
     }
   });
 
-  // Filter and optimize label detection data
-  const optimizedLabels = labels
-    .filter(
-      (label) =>
-        label &&
-        typeof label === "object" &&
-        (label.confidence || 0) >= CONFIDENCE_THRESHOLD
-    )
-    .reduce((acc, label) => {
-      if (!label.timestamp) return acc;
+  // Process label detection data with minimal filtering
+  const processedLabels = labels.map((label) => ({
+    description: label.description || "",
+    confidence: label.confidence || 0,
+    timestamp: label.timestamp || 0,
+    context: {
+      segment: Math.floor((label.timestamp || 0) / 2),
+      timeRange: [
+        Math.floor((label.timestamp || 0) / 2) * 2,
+        (Math.floor((label.timestamp || 0) / 2) + 1) * 2,
+      ],
+      duration: 2,
+      frequency: 1,
+    },
+  }));
 
-      const segmentKey = Math.floor(label.timestamp / FRAME_INTERVAL_SECONDS);
-      if (!acc[segmentKey]) {
-        acc[segmentKey] = [];
-      }
-      if (acc[segmentKey].length < MAX_LABELS_PER_SEGMENT) {
-        acc[segmentKey].push({
-          description: label.description || "",
-          confidence: label.confidence || 0,
-          timestamp: label.timestamp,
-        });
-      }
-      return acc;
-    }, {});
-
-  // Flatten and sort labels by confidence
-  const flattenedLabels = Object.values(optimizedLabels)
-    .flat()
-    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-
-  // Filter and optimize text detection data
-  const optimizedText = text
-    .filter(
-      (text) =>
-        text &&
-        typeof text === "object" &&
-        (text.confidence || 0) >= CONFIDENCE_THRESHOLD
-    )
-    .map((text) => ({
-      text: text.text || "",
+  // Process text detection data with minimal filtering
+  const processedText = text.map((text) => ({
+    text: text.text || "",
+    confidence: text.confidence || 0,
+    timestamp: text.timestamp || 0,
+    originalText: text.text || "",
+    context: {
       confidence: text.confidence || 0,
       timestamp: text.timestamp || 0,
-    }));
+      duration: 1,
+      frequency: 1,
+    },
+  }));
+
+  // Group text by proximity to combine related information
+  const groupedText = processedText.reduce((acc, text) => {
+    const timeWindow = 5; // 5 seconds window
+    const key = Math.floor(text.timestamp / timeWindow);
+
+    if (!acc[key]) {
+      acc[key] = [];
+    }
+
+    acc[key].push(text);
+    return acc;
+  }, {});
+
+  // Combine text within each time window
+  const combinedText = Object.values(groupedText).map((texts) => {
+    const combined = texts.reduce(
+      (acc, text) => {
+        acc.text += " " + text.text;
+        acc.confidence = Math.max(acc.confidence, text.confidence);
+        acc.timestamps.push(text.timestamp);
+        return acc;
+      },
+      {
+        text: "",
+        confidence: 0,
+        timestamps: [],
+      }
+    );
+
+    return {
+      text: combined.text.trim(),
+      confidence: combined.confidence,
+      timestamp: Math.min(...combined.timestamps),
+      originalTexts: texts,
+      context: {
+        duration:
+          Math.max(...combined.timestamps) - Math.min(...combined.timestamps),
+        frequency: texts.length,
+        timeRange: [
+          Math.min(...combined.timestamps),
+          Math.max(...combined.timestamps),
+        ],
+      },
+    };
+  });
 
   console.log(
-    `[${new Date().toISOString()}] ✅ Optimized data:`,
-    `Objects: ${Object.keys(optimizedObjects).length}, Labels: ${
-      flattenedLabels.length
-    }, Text: ${optimizedText.length}`
+    `[${new Date().toISOString()}] ✅ Processed data:`,
+    `Objects: ${Object.keys(processedObjects).length}, Labels: ${
+      processedLabels.length
+    }, Text: ${combinedText.length}`
   );
 
   return {
-    objects: optimizedObjects,
-    labels: flattenedLabels,
-    text: optimizedText,
+    objects: processedObjects,
+    labels: processedLabels,
+    text: combinedText,
+    metadata: {
+      originalObjectCount: objects.length,
+      originalLabelCount: labels.length,
+      originalTextCount: text.length,
+      processingStats: {
+        objectRetentionRate:
+          (Object.keys(processedObjects).length / objects.length) * 100,
+        labelRetentionRate: (processedLabels.length / labels.length) * 100,
+        textRetentionRate: (combinedText.length / text.length) * 100,
+      },
+    },
   };
 }
 
-// Function to extract property details using Gemini
-async function extractPropertyDetailsWithGemini(
+// Function to repair malformed JSON
+function repairJson(text) {
+  try {
+    // First try to parse as is
+    JSON.parse(text);
+    return text;
+  } catch (error) {
+    console.log(
+      `[${new Date().toISOString()}] 🔧 Attempting to repair malformed JSON...`
+    );
+
+    // Remove any non-JSON text before and after the JSON object
+    let repaired = text.trim();
+
+    // Find the first { and last }
+    const firstBrace = repaired.indexOf("{");
+    const lastBrace = repaired.lastIndexOf("}");
+
+    if (firstBrace === -1 || lastBrace === -1) {
+      throw new Error("No valid JSON object found");
+    }
+
+    repaired = repaired.substring(firstBrace, lastBrace + 1);
+
+    // Fix common JSON issues
+    repaired = repaired
+      // Fix missing quotes around property names
+      .replace(/([{,]\s*)([a-zA-Z0-9_]+)(\s*:)/g, '$1"$2"$3')
+      // Fix missing quotes around string values
+      .replace(/(:\s*)([a-zA-Z0-9_]+)(\s*[,}])/g, '$1"$2"$3')
+      // Fix missing commas between properties
+      .replace(/}\s*{/g, "},{")
+      // Fix missing commas in arrays
+      .replace(/]\s*\[/g, "],[")
+      // Fix missing quotes in arrays
+      .replace(/\[\s*([a-zA-Z0-9_]+)\s*\]/g, '["$1"]')
+      // Fix missing quotes around confidence scores
+      .replace(/"confidence":\s*(\d+)/g, '"confidence":"$1"')
+      // Remove any trailing commas
+      .replace(/,(\s*[}\]])/g, "$1")
+      // Fix any remaining unquoted strings
+      .replace(/([{,]\s*)([a-zA-Z0-9_]+)(\s*:)/g, '$1"$2"$3')
+      // Fix any remaining unquoted values
+      .replace(/(:\s*)([a-zA-Z0-9_]+)(\s*[,}])/g, '$1"$2"$3');
+
+    try {
+      // Try to parse the repaired JSON
+      JSON.parse(repaired);
+      return repaired;
+    } catch (repairError) {
+      console.error(
+        `[${new Date().toISOString()}] ❌ Failed to repair JSON:`,
+        repairError
+      );
+      throw new Error(`Failed to repair JSON: ${repairError.message}`);
+    }
+  }
+}
+
+// Function to clean and optimize data for API calls
+function cleanDataForAPI(data, type) {
+  switch (type) {
+    case "labels":
+      return data.map((label) => ({
+        description: label.description,
+        confidence: label.confidence,
+      }));
+
+    case "text":
+      return data.map((text) => ({
+        text: text.text,
+        confidence: text.confidence,
+      }));
+
+    default:
+      return data;
+  }
+}
+
+// Function to extract property details using ChatGPT
+async function extractPropertyDetailsWithChatGPT(
   transcription,
-  objectSummary,
   labelSummary,
   textSummary
 ) {
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-
-  // Optimize the data before sending to Gemini
-  const optimizedData = optimizeVideoData(
-    objectSummary,
-    labelSummary,
-    textSummary
-  );
-
-  const prompt = `
-    Analyze this property video and extract details in JSON format:
-
-    Transcription: ${transcription}
-    Objects: ${JSON.stringify(optimizedData.objects, null, 2)}
-    Labels: ${JSON.stringify(optimizedData.labels, null, 2)}
-    Text: ${JSON.stringify(optimizedData.text, null, 2)}
-
-    Return a JSON object with:
-    {
-      "type": {
-        "value": "property type",
-        "confidence": "0-100"
-      },
-      "style": {
-        "value": "architectural style",
-        "confidence": "0-100"
-      },
-      "bedrooms": "number",
-      "bathrooms": "number",
-      "squareFootage": "total sq ft",
-      "yearBuilt": "year",
-      "lotSize": "acres",
-      "features": ["key features"],
-      "description": {
-        "value": "Comprehensive description including: style, features, rooms, condition, updates, outdoor spaces, smart features, and location benefits",
-        "confidence": "0-100"
-      },
-      "roomDetails": [
-        {
-          "room": "name",
-          "features": ["features"],
-          "description": "brief description",
-          "confidence": "0-100"
-        }
-      ],
-      "detectedObjects": {
-        "furniture": ["item (count: X, confidence: Y%)"],
-        "appliances": ["item (count: X, confidence: Y%)"],
-        "fixtures": ["item (count: X, confidence: Y%)"],
-        "other": ["item (count: X, confidence: Y%)"]
-      },
-      "detectedLabels": {
-        "rooms": ["room (confidence: Y%)"],
-        "styles": ["style (confidence: Y%)"],
-        "materials": ["material (confidence: Y%)"],
-        "features": ["feature (confidence: Y%)"],
-        "other": ["label (confidence: Y%)"]
-      },
-      "detectedText": {
-        "propertyDetails": ["text (confidence: Y%)"],
-        "prices": ["price info"],
-        "other": ["other text"]
-      }
-    }
-
-    Only return the JSON object.`;
-
   try {
     console.log(
-      `[${new Date().toISOString()}] 🤖 Calling Gemini API for property analysis`
+      `[${new Date().toISOString()}] 🤖 Starting multi-stage ChatGPT analysis`
     );
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
 
-    // Extract the JSON object from the response
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+    // Clean data for API calls
+    const cleanedLabels = cleanDataForAPI(labelSummary, "labels");
+    const cleanedText = cleanDataForAPI(textSummary, "text");
+
+    // 1. Analyze Transcription
+    const transcriptionAnalysis = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo-16k",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional real estate analyst. Your task is to analyze property video transcription data and extract key information about the property.",
+        },
+        {
+          role: "user",
+          content: `
+            Analyze this property video transcription and extract key information about the property.
+            Focus on:
+            - Property type and style
+            - Room descriptions and features
+            - Notable amenities and upgrades
+            - Price information
+            - Location details
+            - Any specific property characteristics mentioned
+
+            Transcription:
+            ${transcription || "No transcription available"}
+
+            Return a JSON object with:
+            {
+              "propertyType": "Inferred property type",
+              "style": "Architectural style",
+              "rooms": ["List of rooms mentioned"],
+              "features": ["List of features mentioned"],
+              "amenities": ["List of amenities mentioned"],
+              "price": "Any price information",
+              "location": "Location details",
+              "specialCharacteristics": ["Unique features mentioned"],
+              "confidence": "Overall confidence in analysis (0-100)",
+              "reasoning": "Explanation of how conclusions were drawn"
+            }`,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 2000,
+    });
+
+    // 2. Analyze Label Detection
+    const labelAnalysis = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo-16k",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional real estate analyst. Your task is to analyze property video label detection data and extract key information about the property's features and characteristics.",
+        },
+        {
+          role: "user",
+          content: `
+            Analyze this property video label detection data and extract key information about the property.
+            Focus on:
+            - Room types and spaces
+            - Architectural features
+            - Design elements
+            - Property style indicators
+            - Quality and condition indicators
+
+            Label Detection Data:
+            ${JSON.stringify(cleanedLabels, null, 2)}
+
+            Return a JSON object with:
+            {
+              "roomTypes": ["List of detected room types"],
+              "architecturalFeatures": ["List of architectural features"],
+              "designElements": ["List of design elements"],
+              "styleIndicators": ["List of style indicators"],
+              "qualityIndicators": ["List of quality indicators"],
+              "confidence": "Overall confidence in analysis (0-100)",
+              "reasoning": "Explanation of how conclusions were drawn"
+            }`,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 2000,
+    });
+
+    // 3. Analyze Text Detection
+    const textAnalysis = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo-16k",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional real estate analyst. Your task is to analyze property video text detection data and extract key information about the property's features and specifications.",
+        },
+        {
+          role: "user",
+          content: `
+            Analyze this property video text detection data and extract key information about the property.
+            Focus on:
+            - Property specifications
+            - Room labels and signs
+            - Price information
+            - Address and location details
+            - Any visible property information
+
+            Text Detection Data:
+            ${JSON.stringify(cleanedText, null, 2)}
+
+            Return a JSON object with:
+            {
+              "specifications": ["List of property specifications"],
+              "roomLabels": ["List of room labels"],
+              "priceInformation": "Any price information",
+              "locationDetails": "Location information",
+              "visibleInformation": ["List of visible property information"],
+              "confidence": "Overall confidence in analysis (0-100)",
+              "reasoning": "Explanation of how conclusions were drawn"
+            }`,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 2000,
+    });
+
+    // 4. Generate Final Property Analysis with GPT-4 for complex reasoning
+    const finalAnalysis = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo-16k",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional real estate analyst. Your task is to combine multiple data sources to create a comprehensive property analysis. Use your expertise to make intelligent inferences and connections between different data points.",
+        },
+        {
+          role: "user",
+          content: `
+            Combine these property analysis results to create a comprehensive property listing.
+            Use all available data to make informed inferences about the property.
+            Look for patterns and relationships between different data sources to draw stronger conclusions.
+
+            Transcription Analysis:
+            ${transcriptionAnalysis.choices[0].message.content}
+
+            Label Detection Analysis:
+            ${labelAnalysis.choices[0].message.content}
+
+            Text Detection Analysis:
+            ${textAnalysis.choices[0].message.content}
+
+            Return a detailed JSON object with:
+            {
+              "propertyOverview": {
+                "type": {
+                  "value": "Infer property type (e.g., Single Family Home, Condo, etc.)",
+                  "confidence": "0-100",
+                  "reasoning": "Explain how this was determined"
+                },
+                "style": {
+                  "value": "Architectural style based on visual elements and descriptions",
+                  "confidence": "0-100",
+                  "reasoning": "Explain style indicators"
+                },
+                "condition": {
+                  "value": "Overall condition (Excellent, Good, Fair, etc.)",
+                  "confidence": "0-100",
+                  "reasoning": "List condition indicators"
+                }
+              },
+              "specifications": {
+                "bedrooms": {
+                  "value": "number",
+                  "confidence": "0-100",
+                  "reasoning": "Evidence for bedroom count"
+                },
+                "bathrooms": {
+                  "value": "number",
+                  "confidence": "0-100",
+                  "reasoning": "Evidence for bathroom count"
+                },
+                "squareFootage": {
+                  "value": "total sq ft",
+                  "confidence": "0-100",
+                  "reasoning": "Size indicators"
+                },
+                "yearBuilt": {
+                  "value": "year",
+                  "confidence": "0-100",
+                  "reasoning": "Age indicators"
+                },
+                "lotSize": {
+                  "value": "acres/sq ft",
+                  "confidence": "0-100",
+                  "reasoning": "Lot size indicators"
+                }
+              },
+              "features": {
+                "interior": ["List with confidence scores"],
+                "exterior": ["List with confidence scores"],
+                "upgrades": ["List with confidence scores"],
+                "amenities": ["List with confidence scores"]
+              },
+              "roomAnalysis": [
+                {
+                  "room": "name",
+                  "features": ["detailed features"],
+                  "condition": "condition assessment",
+                  "highlights": ["notable elements"],
+                  "confidence": "0-100"
+                }
+              ],
+              "constructionDetails": {
+                "materials": ["List with confidence scores"],
+                "quality": {
+                  "value": "assessment",
+                  "confidence": "0-100"
+                },
+                "specialFeatures": ["List with confidence scores"]
+              },
+              "locationContext": {
+                "setting": {
+                  "value": "Urban/Suburban/Rural",
+                  "confidence": "0-100"
+                },
+                "surroundings": ["Notable elements"]
+              }
+            }
+
+            Guidelines:
+            1. Use all available data sources to make informed inferences
+            2. Look for patterns and correlations between different data sources
+            3. When information is unclear, use multiple data points to make educated estimates
+            4. Provide detailed reasoning that references specific data points
+            5. Consider the reliability and confidence of each data source
+            6. Format numbers consistently (e.g., "2,500" for square footage)
+            7. Use proper capitalization and complete sentences in descriptions
+            8. Ensure all JSON is properly formatted
+            9. Return only the JSON object, no additional text`,
+        },
+      ],
+      temperature: 0.7,
+      max_tokens: 4000,
+    });
+
+    // Parse and validate the final analysis
+    let finalJson;
+    try {
+      // Clean the response text
+      let cleanedText = finalAnalysis.choices[0].message.content.trim();
+
+      // Remove any text before the first {
+      const firstBraceIndex = cleanedText.indexOf("{");
+      if (firstBraceIndex === -1) {
+        throw new Error("No JSON object found in response");
+      }
+      cleanedText = cleanedText.substring(firstBraceIndex);
+
+      // Remove any text after the last }
+      const lastBraceIndex = cleanedText.lastIndexOf("}");
+      if (lastBraceIndex === -1) {
+        throw new Error("Invalid JSON structure - missing closing brace");
+      }
+      cleanedText = cleanedText.substring(0, lastBraceIndex + 1);
+
+      // Remove any markdown code block indicators
+      cleanedText = cleanedText.replace(/```json\s*|\s*```/g, "");
+
+      // Remove any explanatory text or comments
+      cleanedText = cleanedText.replace(/\/\/.*$/gm, "");
+
+      // Try to parse the cleaned JSON
+      finalJson = JSON.parse(cleanedText);
+
+      // Validate required fields
+      if (!finalJson.propertyOverview || !finalJson.specifications) {
+        throw new Error("Missing required sections in response");
+      }
+
+      // Validate and clean up confidence scores
+      const cleanConfidenceScores = (obj) => {
+        if (typeof obj === "object" && obj !== null) {
+          Object.keys(obj).forEach((key) => {
+            if (key === "confidence" && typeof obj[key] === "string") {
+              // Convert confidence string to number
+              const score = parseInt(obj[key]);
+              obj[key] = isNaN(score) ? 0 : score;
+            } else {
+              cleanConfidenceScores(obj[key]);
+            }
+          });
+        }
+      };
+
+      cleanConfidenceScores(finalJson);
+
+      return finalJson;
+    } catch (parseError) {
+      console.error(
+        `[${new Date().toISOString()}] ❌ JSON parsing error:`,
+        parseError
+      );
+      console.error("Raw response:", finalAnalysis.choices[0].message.content);
+      throw new Error(`Failed to parse JSON response: ${parseError.message}`);
     }
-    throw new Error("Failed to parse Gemini response as JSON");
   } catch (error) {
     console.error(
-      `[${new Date().toISOString()}] ❌ Error extracting property details with Gemini:`,
+      `[${new Date().toISOString()}] ❌ Error in enhanced property analysis:`,
+      error
+    );
+    throw error;
+  }
+}
+
+// Function to generate and save formatted document to Google Drive
+async function generateAndSaveDocument(propertyDetails, driveFileId, fileName) {
+  try {
+    console.log(
+      `[${new Date().toISOString()}] 📝 Generating formatted document...`
+    );
+
+    // Clean up any markdown or special characters in the property details
+    const cleanPropertyDetails = JSON.parse(JSON.stringify(propertyDetails));
+    const cleanMarkdown = (obj) => {
+      if (typeof obj === "string") {
+        return obj
+          .replace(/\*\*/g, "") // Remove bold markdown
+          .replace(/\*/g, "") // Remove italic markdown
+          .replace(/`/g, "") // Remove code markdown
+          .replace(/\[|\]/g, "") // Remove square brackets
+          .replace(/#{1,6}\s/g, "") // Remove heading markdown
+          .replace(/\n\s*[-*+]\s/g, "\n• ") // Convert markdown lists to bullet points
+          .trim();
+      }
+      if (typeof obj === "object" && obj !== null) {
+        Object.keys(obj).forEach((key) => {
+          obj[key] = cleanMarkdown(obj[key]);
+        });
+      }
+      return obj;
+    };
+
+    const cleanedDetails = cleanMarkdown(cleanPropertyDetails);
+
+    const prompt = `
+      Create a factual property listing document based on video analysis and transcript data.
+      Focus on objective features and details observed in the video.
+      
+      Property Description
+      [Write a detailed factual description based on video analysis and transcript. Include:
+      - Property type and style
+      - Key structural features
+      - Notable materials and finishes
+      - Room layout and flow
+      - Any unique architectural elements
+      - Observed condition and maintenance
+      Focus on facts, not marketing language]
+
+      Property Details
+      Type: [Property Type]
+      Style: [Architectural Style]
+      Year Built: [Year]
+      Square Footage: [Size]
+      Lot Size: [Size]
+      Bedrooms: [Number]
+      Bathrooms: [Number]
+      Condition: [Condition]
+
+      Features
+      Interior:
+      • [List all observed interior features, materials, and finishes]
+
+      Exterior:
+      • [List all observed exterior features, materials, and finishes]
+
+      Rooms
+      [List each room with all observed features, including:
+      - Dimensions (if visible)
+      - Materials and finishes
+      - Built-in features
+      - Natural light sources
+      - Flooring type
+      - Ceiling features]
+
+      Location
+      Setting: [Urban/Suburban/Rural]
+      • [List all observed location features, including:
+      - Street type and condition
+      - Surrounding structures
+      - Natural features
+      - Access points
+      - Parking arrangements]`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo-16k",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a property analyst. Create detailed, factual property listings based on video analysis and transcript data. Focus on objective features and avoid marketing language. Do not use any markdown formatting in your response.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0.3,
+      max_tokens: 3000,
+    });
+
+    let formattedContent = completion.choices[0].message.content;
+
+    // Post-process the content to ensure clean formatting
+    formattedContent = formattedContent
+      .replace(/<[^>]*>/g, "") // Remove any HTML tags
+      .replace(/\r\n/g, "\n") // Normalize line breaks
+      .replace(/\n{3,}/g, "\n\n") // Remove excessive line breaks
+      .replace(/^([A-Z][A-Z\s&]+)$/gm, "$1") // Preserve section headers
+      .replace(/•\s*/g, "• ") // Standardize bullet points
+      .replace(/[-_]\s/g, "• ") // Convert dashes and underscores at start of lines to bullets
+      .trim();
+
+    try {
+      console.log(
+        `[${new Date().toISOString()}] 📄 Creating document in folder: ${driveFileId}`
+      );
+
+      const fileMetadata = {
+        name: `${fileName.split(".")[0]} - MLS Listing`,
+        parents: [PROPERTY_ANALYSIS_FOLDER_ID],
+        mimeType: "application/vnd.google-apps.document",
+      };
+
+      // Create an empty Google Doc
+      const file = await drive.files.create({
+        requestBody: fileMetadata,
+        media: {
+          mimeType: "application/vnd.google-apps.document",
+          body: "",
+        },
+        fields: "id, name, webViewLink",
+      });
+
+      const docs = google.docs({ version: "v1", auth });
+
+      // Insert content first
+      await docs.documents.batchUpdate({
+        documentId: file.data.id,
+        requestBody: {
+          requests: [
+            {
+              insertText: {
+                location: { index: 1 },
+                text: formattedContent,
+              },
+            },
+          ],
+        },
+      });
+
+      // Get the document to find section locations
+      const document = await docs.documents.get({
+        documentId: file.data.id,
+      });
+
+      // Prepare styling requests
+      const requests = [];
+      let currentIndex = 1;
+
+      // Process each paragraph
+      document.data.body.content.forEach((element) => {
+        if (element.paragraph) {
+          const text = element.paragraph.elements[0].textRun?.content || "";
+          const trimmedText = text.trim();
+
+          // Check if this is a section header (all caps)
+          if (trimmedText.match(/^[A-Z][A-Z\s&]+$/)) {
+            requests.push({
+              updateParagraphStyle: {
+                range: {
+                  startIndex: currentIndex,
+                  endIndex: currentIndex + text.length,
+                },
+                paragraphStyle: {
+                  namedStyleType: "HEADING_2",
+                },
+                fields: "namedStyleType",
+              },
+            });
+          }
+
+          currentIndex += text.length;
+        }
+      });
+
+      // Apply styles if there are any
+      if (requests.length > 0) {
+        await docs.documents.batchUpdate({
+          documentId: file.data.id,
+          requestBody: { requests },
+        });
+      }
+
+      // Make the file publicly accessible
+      await drive.permissions.create({
+        fileId: file.data.id,
+        requestBody: {
+          role: "reader",
+          type: "anyone",
+        },
+      });
+
+      // Get the public link
+      const fileDetails = await drive.files.get({
+        fileId: file.data.id,
+        fields: "id, name, webViewLink, webContentLink",
+      });
+
+      console.log(
+        `[${new Date().toISOString()}] ✅ Document created successfully:`,
+        `\nID: ${fileDetails.data.id}`,
+        `\nName: ${fileDetails.data.name}`,
+        `\nView Link: ${fileDetails.data.webViewLink}`,
+        `\nDownload Link: ${fileDetails.data.webContentLink}`
+      );
+
+      return {
+        fileId: fileDetails.data.id,
+        viewLink: fileDetails.data.webViewLink,
+        downloadLink: fileDetails.data.webContentLink,
+      };
+    } catch (createError) {
+      console.error(
+        `[${new Date().toISOString()}] ❌ Document creation error:`,
+        createError.message
+      );
+      throw new Error(`Failed to create document: ${createError.message}`);
+    }
+  } catch (error) {
+    console.error(
+      `[${new Date().toISOString()}] ❌ Error generating document:`,
       error
     );
     throw error;
@@ -324,12 +959,6 @@ async function processVideo(
     },
   };
 
-  // Request video annotation for object tracking
-  const objectTrackingRequest = {
-    inputUri: gcsUri,
-    features: ["OBJECT_TRACKING"],
-  };
-
   // Request video annotation for label detection
   const labelDetectionRequest = {
     inputUri: gcsUri,
@@ -348,9 +977,6 @@ async function processVideo(
     const [transcriptionOperation] = await videoClient.annotateVideo(
       transcriptionRequest
     );
-    const [objectTrackingOperation] = await videoClient.annotateVideo(
-      objectTrackingRequest
-    );
     const [labelDetectionOperation] = await videoClient.annotateVideo(
       labelDetectionRequest
     );
@@ -364,14 +990,12 @@ async function processVideo(
 
     // Wait for all operations to complete
     const [transcriptionResponse] = await transcriptionOperation.promise();
-    const [objectTrackingResponse] = await objectTrackingOperation.promise();
     const [labelDetectionResponse] = await labelDetectionOperation.promise();
     const [textDetectionResponse] = await textDetectionOperation.promise();
 
     console.log(`[${new Date().toISOString()}] ✅ Video analysis completed`);
 
     const transcriptionResults = transcriptionResponse.annotationResults[0];
-    const objectTrackingResults = objectTrackingResponse.annotationResults[0];
     const labelDetectionResults = labelDetectionResponse.annotationResults[0];
     const textDetectionResults = textDetectionResponse.annotationResults[0];
 
@@ -388,15 +1012,6 @@ async function processVideo(
           (transcription) => transcription.alternatives[0]?.transcript || ""
         )
         .join(" ") || "";
-
-    // Extract object tracking information
-    const trackedObjects = (objectTrackingResults?.objectAnnotations || []).map(
-      (track) => ({
-        description: track.entity.description,
-        confidence: track.frames[0].normalizedBoundingBox.confidence,
-        timestamp: track.frames[0].timeOffset.seconds,
-      })
-    );
 
     // Extract label detection information
     const detectedLabels = (
@@ -416,194 +1031,15 @@ async function processVideo(
       })
     );
 
-    // Filter and group objects by type
-    const objectSummary = trackedObjects.reduce((acc, obj) => {
-      const key = obj.description.toLowerCase();
-      if (!acc[key]) {
-        acc[key] = {
-          count: 0,
-          confidence: 0,
-          occurrences: [],
-        };
-      }
-      acc[key].count++;
-      acc[key].confidence += obj.confidence;
-      acc[key].occurrences.push(obj.timestamp);
-      return acc;
-    }, {});
-
-    // Calculate average confidence for each object type
-    Object.keys(objectSummary).forEach((key) => {
-      objectSummary[key].confidence =
-        objectSummary[key].confidence / objectSummary[key].count;
-    });
-
-    // Categorize objects into furniture, appliances, fixtures, and other
-    const categorizedObjects = {
-      furniture: [],
-      appliances: [],
-      fixtures: [],
-      other: [],
-    };
-
-    const furnitureKeywords = [
-      "chair",
-      "table",
-      "sofa",
-      "couch",
-      "bed",
-      "desk",
-      "cabinet",
-      "dresser",
-      "wardrobe",
-      "bookshelf",
-    ];
-    const applianceKeywords = [
-      "refrigerator",
-      "stove",
-      "oven",
-      "dishwasher",
-      "washer",
-      "dryer",
-      "microwave",
-      "air conditioner",
-    ];
-    const fixtureKeywords = [
-      "sink",
-      "toilet",
-      "bathtub",
-      "shower",
-      "faucet",
-      "light",
-      "fan",
-      "vent",
-    ];
-
-    Object.entries(objectSummary).forEach(([object, data]) => {
-      const objectLower = object.toLowerCase();
-      if (furnitureKeywords.some((keyword) => objectLower.includes(keyword))) {
-        categorizedObjects.furniture.push({ name: object, ...data });
-      } else if (
-        applianceKeywords.some((keyword) => objectLower.includes(keyword))
-      ) {
-        categorizedObjects.appliances.push({ name: object, ...data });
-      } else if (
-        fixtureKeywords.some((keyword) => objectLower.includes(keyword))
-      ) {
-        categorizedObjects.fixtures.push({ name: object, ...data });
-      } else {
-        categorizedObjects.other.push({ name: object, ...data });
-      }
-    });
-
-    // Categorize labels into relevant property aspects
-    const categorizedLabels = {
-      rooms: [],
-      styles: [],
-      materials: [],
-      features: [],
-      other: [],
-    };
-
-    const roomKeywords = [
-      "kitchen",
-      "bedroom",
-      "bathroom",
-      "living room",
-      "dining room",
-      "garage",
-      "basement",
-    ];
-    const styleKeywords = [
-      "modern",
-      "traditional",
-      "contemporary",
-      "classic",
-      "minimalist",
-      "rustic",
-    ];
-    const materialKeywords = [
-      "wood",
-      "marble",
-      "granite",
-      "stainless steel",
-      "ceramic",
-      "glass",
-      "concrete",
-    ];
-
-    detectedLabels.forEach((label) => {
-      const labelLower = label.description.toLowerCase();
-      if (roomKeywords.some((keyword) => labelLower.includes(keyword))) {
-        categorizedLabels.rooms.push({
-          name: label.description,
-          confidence: label.confidence,
-        });
-      } else if (
-        styleKeywords.some((keyword) => labelLower.includes(keyword))
-      ) {
-        categorizedLabels.styles.push({
-          name: label.description,
-          confidence: label.confidence,
-        });
-      } else if (
-        materialKeywords.some((keyword) => labelLower.includes(keyword))
-      ) {
-        categorizedLabels.materials.push({
-          name: label.description,
-          confidence: label.confidence,
-        });
-      } else if (
-        labelLower.includes("feature") ||
-        labelLower.includes("design")
-      ) {
-        categorizedLabels.features.push({
-          name: label.description,
-          confidence: label.confidence,
-        });
-      } else {
-        categorizedLabels.other.push({
-          name: label.description,
-          confidence: label.confidence,
-        });
-      }
-    });
-
-    // Display summaries of extracted information
-    console.log(`\n[${new Date().toISOString()}] 📊 Analysis Summary:`);
-    console.log(`Transcription: ${transcription.length} characters`);
-    console.log(
-      `Detected Objects: ${Object.keys(objectSummary).length} unique items`
-    );
-    console.log(`Detected Labels: ${detectedLabels.length} scenes/features`);
-    console.log(`Detected Text: ${detectedText.length} text segments`);
-
-    // Create a simplified summary for verification
-    const simplifiedSummary = {
-      type: objectSummary.type || "Not specified",
-      style: objectSummary.style || "Not specified",
-      bedrooms: objectSummary.bedrooms || "Not specified",
-      squareFootage: objectSummary.squareFootage || "Not specified",
-      roomCount: objectSummary.roomDetails
-        ? objectSummary.roomDetails.length
-        : 0,
-    };
-
-    console.log(
-      `[${new Date().toISOString()}] 📊 Simplified property summary:`,
-      simplifiedSummary
-    );
-
     // Store raw analysis results in Firestore
     console.log(
       `[${new Date().toISOString()}] 📝 Storing raw analysis in Firestore...`
     );
     const firestoreId = await firestoreService.storeVideoAnalysis(fileName, {
       transcription,
-      objects: trackedObjects,
       labels: detectedLabels,
       text: detectedText,
-      driveFileId, // Store Drive file ID in Firestore as well
+      driveFileId,
     });
 
     // Check if we got a fallback ID
@@ -619,15 +1055,27 @@ async function processVideo(
       );
     }
 
-    // Extract property details using Gemini
-    console.log(`[${new Date().toISOString()}] 🤖 Processing with Gemini...`);
-    const propertyDetails = await extractPropertyDetailsWithGemini(
+    // Extract property details using ChatGPT
+    console.log(`[${new Date().toISOString()}] 🤖 Processing with ChatGPT...`);
+    const propertyDetails = await extractPropertyDetailsWithChatGPT(
       transcription,
-      categorizedObjects,
-      categorizedLabels,
+      detectedLabels,
       detectedText
     );
-    console.log(`[${new Date().toISOString()}] ✅ Gemini analysis completed`);
+    console.log(`[${new Date().toISOString()}] ✅ ChatGPT analysis completed`);
+
+    // Generate and save formatted document to Google Drive
+    console.log(
+      `[${new Date().toISOString()}] 📝 Generating and saving formatted document...`
+    );
+    const documentId = await generateAndSaveDocument(
+      propertyDetails,
+      driveFileId,
+      fileName
+    );
+    console.log(
+      `[${new Date().toISOString()}] ✅ Formatted document saved to Google Drive`
+    );
 
     // Store processed analysis in Firestore
     console.log(
@@ -639,10 +1087,20 @@ async function processVideo(
       propertyDetails,
       driveFileId,
       {
-        simplifiedSummary,
-        categorizedObjects,
-        categorizedLabels,
-        detectedText,
+        simplifiedSummary: {
+          type:
+            propertyDetails.propertyOverview?.type?.value || "Not specified",
+          style:
+            propertyDetails.propertyOverview?.style?.value || "Not specified",
+          bedrooms:
+            propertyDetails.specifications?.bedrooms?.value || "Not specified",
+          squareFootage:
+            propertyDetails.specifications?.squareFootage?.value ||
+            "Not specified",
+          roomCount: propertyDetails.roomAnalysis?.length || 0,
+        },
+        categorizedLabels: detectedLabels,
+        detectedText: detectedText,
         isFallbackStorage: isFallbackId,
       }
     );
@@ -653,9 +1111,11 @@ async function processVideo(
     // Log a brief summary of the property details
     console.log(
       `[${new Date().toISOString()}] 📊 Property details: ${
-        propertyDetails.type || "Unknown type"
-      }, ${propertyDetails.style || "Unknown style"}, ${
-        propertyDetails.bedrooms || "Unknown bedrooms"
+        propertyDetails.propertyOverview?.type?.value || "Unknown type"
+      }, ${
+        propertyDetails.propertyOverview?.style?.value || "Unknown style"
+      }, ${
+        propertyDetails.specifications?.bedrooms?.value || "Unknown bedrooms"
       } beds`
     );
 
@@ -669,7 +1129,17 @@ async function processVideo(
       success: true,
       transcription,
       propertyDetails,
-      simplifiedSummary,
+      simplifiedSummary: {
+        type: propertyDetails.propertyOverview?.type?.value || "Not specified",
+        style:
+          propertyDetails.propertyOverview?.style?.value || "Not specified",
+        bedrooms:
+          propertyDetails.specifications?.bedrooms?.value || "Not specified",
+        squareFootage:
+          propertyDetails.specifications?.squareFootage?.value ||
+          "Not specified",
+        roomCount: propertyDetails.roomAnalysis?.length || 0,
+      },
       firestoreId,
       processedAnalysisId,
     };
@@ -796,7 +1266,7 @@ app.post("/", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
